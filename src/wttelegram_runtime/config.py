@@ -11,6 +11,8 @@ class Settings(BaseSettings):
 
     database_url: str = ""
     database_ssl: bool = False
+    startup_database_max_attempts: int = Field(default=10, ge=1)
+    startup_database_retry_delay: float = Field(default=2.0, gt=0)
 
     public_base_url: str = ""
     webhook_path_prefix: str = "/webhooks/telegram"

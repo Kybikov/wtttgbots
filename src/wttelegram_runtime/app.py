@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+import logging
 from typing import Any
 
 from aiogram import Dispatcher
@@ -15,6 +16,29 @@ from .config import Settings, get_settings
 from .db import create_pool
 from .delivery import send_step, serialize_step
 from .repository import TelegramRepository
+
+logger = logging.getLogger(__name__)
+
+
+async def create_pool_with_retry(settings: Settings):
+    last_error: Exception | None = None
+
+    for attempt in range(1, settings.startup_database_max_attempts + 1):
+        try:
+            return await create_pool(settings)
+        except Exception as error:  # noqa: BLE001
+            last_error = error
+            logger.warning(
+                "Database connection attempt %s/%s failed: %s",
+                attempt,
+                settings.startup_database_max_attempts,
+                error
+            )
+            if attempt >= settings.startup_database_max_attempts:
+                break
+            await asyncio.sleep(settings.startup_database_retry_delay)
+
+    raise RuntimeError("Unable to connect to Postgres during runtime startup") from last_error
 
 
 def register_handlers(dispatcher: Dispatcher, repository: TelegramRepository) -> None:
@@ -34,7 +58,9 @@ def register_handlers(dispatcher: Dispatcher, repository: TelegramRepository) ->
         )
 
         if not steps:
-            await message.answer("Сценарій ще не налаштований. Поверніться трохи пізніше.")
+            await message.answer(
+                "Сценарій ще не налаштований. Поверніться трохи пізніше."
+            )
             return
 
         await repository.cancel_pending_jobs(bot_record.id, chat_id)
@@ -127,7 +153,7 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        pool = await create_pool(settings)
+        pool = await create_pool_with_retry(settings)
         repository = TelegramRepository(pool)
         registry = BotRegistry()
         dispatcher = Dispatcher()
@@ -156,19 +182,29 @@ def create_app() -> FastAPI:
 
     @app.api_route("/", methods=["GET", "HEAD"])
     async def root():
-        repository: TelegramRepository = app.state.repository
         return {
             "ok": True,
             "service": "wttelegram-runtime",
-            "activeBots": await repository.count_active_bots()
+            "status": "running"
         }
 
     @app.api_route("/healthz", methods=["GET", "HEAD"])
     async def healthcheck():
+        return {"ok": True, "status": "healthy"}
+
+    @app.api_route("/readyz", methods=["GET", "HEAD"])
+    async def readiness_check():
         repository: TelegramRepository = app.state.repository
+        try:
+            await repository.ping()
+            active_bots = await repository.count_active_bots()
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=503, detail=f"Database unavailable: {error}") from error
+
         return {
             "ok": True,
-            "activeBots": await repository.count_active_bots()
+            "status": "ready",
+            "activeBots": active_bots
         }
 
     @app.post(f"{settings.webhook_path_prefix}" + "/{bot_id}")

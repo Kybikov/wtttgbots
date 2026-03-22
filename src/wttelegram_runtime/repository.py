@@ -62,6 +62,9 @@ class TelegramRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self.pool = pool
 
+    async def ping(self) -> None:
+        await self.pool.execute("select 1")
+
     async def count_active_bots(self) -> int:
         row = await self.pool.fetchrow(
             """
