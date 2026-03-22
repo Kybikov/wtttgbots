@@ -1,0 +1,11 @@
+aiogram<4,>=3.19
+asyncpg<1,>=0.30
+bleach<7,>=6.2
+fastapi<1,>=0.115
+markdown<4,>=3.8
+pydantic-settings<3,>=2.10
+python-dotenv<2,>=1.1
+uvicorn[standard]<1,>=0.35
+
+[dev]
+ruff<1,>=0.12

@@ -1,0 +1,100 @@
+Metadata-Version: 2.4
+Name: wttelegram-runtime
+Version: 0.1.0
+Summary: Telegram bot runtime for WTmelon admin-managed promo bots
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: aiogram<4,>=3.19
+Requires-Dist: asyncpg<1,>=0.30
+Requires-Dist: bleach<7,>=6.2
+Requires-Dist: fastapi<1,>=0.115
+Requires-Dist: markdown<4,>=3.8
+Requires-Dist: pydantic-settings<3,>=2.10
+Requires-Dist: python-dotenv<2,>=1.1
+Requires-Dist: uvicorn[standard]<1,>=0.35
+Provides-Extra: dev
+Requires-Dist: ruff<1,>=0.12; extra == "dev"
+
+# WTtelegram Runtime
+
+Окремий Python runtime для Telegram-ботів, якими керує адмінка WTmelon.
+
+## Що вже вміє
+
+- приймати Telegram webhook-и через `FastAPI`
+- працювати з багатьма ботами в одному runtime
+- читати ботів, кроки сценарію та кнопки зі спільної Postgres БД
+- відправляти start-ланцюжок одразу після `/start`
+- ставити delayed follow-up кроки в БД-чергу і відправляти їх фоновим воркером
+- приймати markdown-style текст і безпечніше конвертувати його у Telegram HTML
+
+## Схема БД
+
+Перед запуском застосуй міграцію:
+
+- `C:\Users\whoam\WebstormProjects\wtbackend\database\004_telegram_bots_schema.sql`
+
+Runtime використовує ту саму БД, що й `wtbackend`.
+
+## ENV
+
+Скопіюй `.env.example` в `.env` і заповни:
+
+- `DATABASE_URL`
+- `DATABASE_SSL`
+- `PUBLIC_BASE_URL`
+
+`PUBLIC_BASE_URL` має бути зовнішнім HTTPS-доменом runtime, наприклад `https://tg.wtmelon.store`.
+
+## Локальний запуск
+
+```bash
+pip install -e .
+wttelegram-runtime serve
+```
+
+Healthcheck:
+
+```bash
+curl http://localhost:8080/healthz
+```
+
+## Синхронізація webhook-ів
+
+Після того як бот доданий у БД і runtime піднято на публічному домені:
+
+```bash
+wttelegram-runtime sync-webhooks
+```
+
+Для одного бота:
+
+```bash
+wttelegram-runtime sync-webhooks --bot-id <uuid>
+```
+
+## Деплой у Coolify / на NAS
+
+Цей сервіс добре підходить для окремого resource у Coolify, в тому числі на NAS, якщо:
+
+- NAS має публічний HTTPS-домен
+- контейнер може виходити в інтернет до Telegram Bot API
+- контейнер має доступ до вашої спільної Postgres БД
+
+Рекомендована схема:
+
+- `admin.wtmelon.store` -> Vue адмінка
+- `api.wtmelon.store` -> Node backend
+- `tg.wtmelon.store` -> цей Python runtime
+
+## Поточний MVP
+
+Поточний runtime розрахований на template-driven promo bots:
+
+- зображення + текст
+- URL-кнопки
+- delayed follow-up кроки
+- змінні посилання на сайт / канал / покупку / сапорт
+
+Повноцінну UI-панель під це можна добудувати наступним етапом поверх уже готової БД та runtime.
+
