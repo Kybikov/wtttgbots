@@ -154,7 +154,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="WTtelegram Runtime", lifespan=lifespan)
 
-    @app.get("/")
+    @app.api_route("/", methods=["GET", "HEAD"])
     async def root():
         repository: TelegramRepository = app.state.repository
         return {
@@ -163,7 +163,7 @@ def create_app() -> FastAPI:
             "activeBots": await repository.count_active_bots()
         }
 
-    @app.get("/healthz")
+    @app.api_route("/healthz", methods=["GET", "HEAD"])
     async def healthcheck():
         repository: TelegramRepository = app.state.repository
         return {
