@@ -21,6 +21,19 @@ class Settings(BaseSettings):
     delivery_batch_size: int = 20
     bot_request_timeout: float = 20.0
     max_job_attempts: int = Field(default=5, ge=1)
+    reminder_poll_interval: float = 60.0
+    reminder_batch_size: int = 40
+    reminder_timezone: str = "Europe/Kyiv"
+    reminder_schedule_hour: int = Field(default=10, ge=0, le=23)
+    reminder_schedule_minute: int = Field(default=0, ge=0, le=59)
+    smtp_host: str = ""
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_from_name: str = "WTmelon"
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import logging
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiogram import Dispatcher
 from aiogram.filters import CommandStart
@@ -15,7 +16,13 @@ from .bot_registry import BotRegistry
 from .config import Settings, get_settings
 from .db import create_pool
 from .delivery import send_step, serialize_step
+from .email_delivery import SmtpEmailSender
 from .repository import TelegramRepository
+from .subscription_reminders import (
+    build_reminder_email_body,
+    build_reminder_subject,
+    build_reminder_telegram_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +48,48 @@ async def create_pool_with_retry(settings: Settings):
     raise RuntimeError("Unable to connect to Postgres during runtime startup") from last_error
 
 
+def extract_start_payload(message: Message) -> str:
+    text = str(message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return ""
+    return parts[1].strip()
+
+
 def register_handlers(dispatcher: Dispatcher, repository: TelegramRepository) -> None:
     @dispatcher.message(CommandStart())
     async def handle_start(message: Message, bot_record: Any) -> None:
         chat_id = message.chat.id
+        start_payload = extract_start_payload(message)
+
+        if start_payload.startswith("crm_"):
+            connect_token = start_payload.removeprefix("crm_").strip()
+            claim = await repository.claim_telegram_connect_token(
+                token=connect_token,
+                bot_id=bot_record.id,
+                chat_id=chat_id,
+                telegram_user_id=message.from_user.id if message.from_user else None,
+                telegram_username=message.from_user.username if message.from_user and message.from_user.username else ""
+            )
+
+            await repository.record_event(
+                bot_id=bot_record.id,
+                chat_id=chat_id,
+                event_type="command.start.crm_connect",
+                payload={
+                    "token": connect_token,
+                    "linked": claim is not None,
+                    "username": message.from_user.username if message.from_user else "",
+                    "message_id": message.message_id
+                }
+            )
+
+            if claim:
+                await message.answer("Telegram успішно підключено. Тепер нагадування про завершення підписки можуть приходити сюди.")
+            else:
+                await message.answer("Посилання для підключення вже неактивне або прострочене. Поверніться в кабінет і згенеруйте нове.")
+            return
+
         steps = await repository.get_steps_for_trigger(bot_record.id, "start")
 
         await repository.record_event(
@@ -148,6 +193,102 @@ async def run_delivery_worker(
         await asyncio.sleep(0)
 
 
+async def run_subscription_reminder_worker(
+    *,
+    repository: TelegramRepository,
+    registry: BotRegistry,
+    settings: Settings
+) -> None:
+    timezone = ZoneInfo(settings.reminder_timezone)
+    email_sender = SmtpEmailSender(settings)
+    last_enqueued_for: date | None = None
+
+    while True:
+        local_now = datetime.now(timezone)
+        if (
+            last_enqueued_for != local_now.date()
+            and (
+                local_now.hour > settings.reminder_schedule_hour
+                or (
+                    local_now.hour == settings.reminder_schedule_hour
+                    and local_now.minute >= settings.reminder_schedule_minute
+                )
+            )
+        ):
+            try:
+                await repository.enqueue_due_subscription_reminders(local_now.date())
+                last_enqueued_for = local_now.date()
+            except Exception as error:  # noqa: BLE001
+                logger.warning("Unable to enqueue due subscription reminders: %s", error)
+
+        jobs = await repository.claim_due_subscription_reminders(settings.reminder_batch_size)
+        if not jobs:
+            await asyncio.sleep(settings.reminder_poll_interval)
+            continue
+
+        for job in jobs:
+            try:
+                if job.channel == "telegram":
+                    if not job.bot or job.chat_id is None:
+                        raise RuntimeError("Telegram reminder is missing bot or chat binding")
+                    bot = await registry.get_bot(job.bot)
+                    message = await bot.send_message(
+                        chat_id=job.chat_id,
+                        text=build_reminder_telegram_text(job)
+                    )
+                    await repository.mark_subscription_reminder_sent(job.id, str(message.message_id))
+                    await repository.record_event(
+                        bot_id=job.bot.id,
+                        chat_id=job.chat_id,
+                        event_type="subscription.reminder.sent.telegram",
+                        payload={
+                            "reminder_id": job.id,
+                            "subscription_id": job.subscription_id,
+                            "reminder_day": job.reminder_day
+                        }
+                    )
+                    continue
+
+                await email_sender.send_plaintext(
+                    recipient=job.target_email,
+                    subject=build_reminder_subject(job),
+                    body=build_reminder_email_body(job)
+                )
+                await repository.mark_subscription_reminder_sent(job.id)
+                await repository.record_event(
+                    bot_id=None,
+                    chat_id=None,
+                    event_type="subscription.reminder.sent.email",
+                    payload={
+                        "reminder_id": job.id,
+                        "subscription_id": job.subscription_id,
+                        "reminder_day": job.reminder_day,
+                        "recipient": job.target_email
+                    }
+                )
+            except Exception as error:  # noqa: BLE001
+                await repository.retry_or_fail_subscription_reminder(
+                    job.id,
+                    attempts=job.attempts,
+                    max_attempts=settings.max_job_attempts,
+                    error_message=str(error)
+                )
+                await repository.record_event(
+                    bot_id=job.bot.id if job.bot else None,
+                    chat_id=job.chat_id,
+                    event_type="subscription.reminder.failed",
+                    payload={
+                        "reminder_id": job.id,
+                        "subscription_id": job.subscription_id,
+                        "channel": job.channel,
+                        "attempts": job.attempts,
+                        "error": str(error)
+                    }
+                )
+
+        await asyncio.sleep(0)
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
 
@@ -161,20 +302,26 @@ def create_app() -> FastAPI:
         worker_task = asyncio.create_task(
             run_delivery_worker(repository=repository, registry=registry, settings=settings)
         )
+        reminder_worker_task = asyncio.create_task(
+            run_subscription_reminder_worker(repository=repository, registry=registry, settings=settings)
+        )
 
         app.state.repository = repository
         app.state.registry = registry
         app.state.dispatcher = dispatcher
         app.state.worker_task = worker_task
+        app.state.reminder_worker_task = reminder_worker_task
 
         try:
             yield
         finally:
-            worker_task.cancel()
-            try:
-                await worker_task
-            except asyncio.CancelledError:
-                pass
+            for task in (worker_task, reminder_worker_task):
+                task.cancel()
+            for task in (worker_task, reminder_worker_task):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             await registry.close()
             await pool.close()
 

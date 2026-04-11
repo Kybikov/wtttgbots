@@ -6,7 +6,7 @@ from typing import Any
 
 import asyncpg
 
-from .models import BotRecord, ButtonRecord, DeliveryJob, StepRecord
+from .models import BotRecord, ButtonRecord, DeliveryJob, ReminderDeliveryJob, StepRecord
 
 
 def _map_bot(row: asyncpg.Record) -> BotRecord:
@@ -402,4 +402,260 @@ class TelegramRepository:
             next_status,
             error_message[:2000],
             next_run_at
+        )
+
+    async def claim_telegram_connect_token(
+        self,
+        *,
+        token: str,
+        bot_id: str,
+        chat_id: int,
+        telegram_user_id: int | None,
+        telegram_username: str
+    ) -> dict[str, Any] | None:
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                token_row = await connection.fetchrow(
+                    """
+                    select
+                      t.id,
+                      t.client_id,
+                      t.portal_user_id,
+                      t.bot_id
+                    from public.crm_client_telegram_connect_tokens t
+                    where t.token = $1
+                      and t.bot_id = $2::uuid
+                      and t.consumed_at is null
+                      and t.expires_at > now()
+                    for update
+                    """,
+                    token,
+                    bot_id
+                )
+                if not token_row:
+                    return None
+
+                await connection.execute(
+                    """
+                    update public.crm_client_telegram_connect_tokens
+                    set consumed_at = now()
+                    where id = $1::uuid
+                    """,
+                    token_row["id"]
+                )
+
+                row = await connection.fetchrow(
+                    """
+                    insert into public.crm_client_telegram_links (
+                      client_id,
+                      portal_user_id,
+                      bot_id,
+                      chat_id,
+                      telegram_user_id,
+                      telegram_username,
+                      linked_at,
+                      last_seen_at,
+                      created_at,
+                      updated_at
+                    )
+                    values (
+                      $1::uuid,
+                      $2::uuid,
+                      $3::uuid,
+                      $4,
+                      $5,
+                      $6,
+                      now(),
+                      now(),
+                      now(),
+                      now()
+                    )
+                    on conflict (client_id) do update
+                    set
+                      portal_user_id = excluded.portal_user_id,
+                      bot_id = excluded.bot_id,
+                      chat_id = excluded.chat_id,
+                      telegram_user_id = excluded.telegram_user_id,
+                      telegram_username = excluded.telegram_username,
+                      linked_at = coalesce(public.crm_client_telegram_links.linked_at, excluded.linked_at),
+                      last_seen_at = now(),
+                      updated_at = now()
+                    returning
+                      client_id,
+                      portal_user_id,
+                      bot_id,
+                      chat_id,
+                      telegram_username,
+                      linked_at,
+                      last_seen_at
+                    """,
+                    token_row["client_id"],
+                    token_row["portal_user_id"],
+                    token_row["bot_id"],
+                    chat_id,
+                    telegram_user_id,
+                    telegram_username
+                )
+
+                return dict(row) if row else None
+
+    async def enqueue_due_subscription_reminders(self, local_date) -> int:
+        row = await self.pool.fetchrow(
+            """
+            select public.crm_enqueue_due_subscription_reminders($1::date) as total
+            """,
+            local_date
+        )
+        return int(row["total"] if row else 0)
+
+    async def claim_due_subscription_reminders(self, limit: int) -> list[ReminderDeliveryJob]:
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                rows = await connection.fetch(
+                    """
+                    with due as (
+                      select d.id
+                      from public.crm_subscription_reminder_deliveries d
+                      where d.status = 'queued'
+                      order by d.created_at asc
+                      for update skip locked
+                      limit $1
+                    ),
+                    claimed as (
+                      update public.crm_subscription_reminder_deliveries d
+                      set
+                        status = 'processing',
+                        attempt_count = d.attempt_count + 1,
+                        updated_at = now()
+                      from due
+                      where d.id = due.id
+                      returning
+                        d.id,
+                        d.subscription_id,
+                        d.client_id,
+                        d.channel,
+                        d.reminder_day,
+                        d.due_date,
+                        d.attempt_count,
+                        d.target_email,
+                        d.bot_id,
+                        d.chat_id,
+                        d.payload
+                    )
+                    select
+                      claimed.*,
+                      s.expires_at,
+                      coalesce(claimed.payload ->> 'clientName', '') as client_name,
+                      coalesce(claimed.payload ->> 'serviceName', '') as service_name,
+                      coalesce(claimed.payload ->> 'planName', '') as plan_name,
+                      jsonb_build_object(
+                        'id', b.id,
+                        'name', b.name,
+                        'public_title', b.public_title,
+                        'bot_username', b.bot_username,
+                        'bot_token', b.bot_token,
+                        'webhook_secret', b.webhook_secret,
+                        'template_key', b.template_key,
+                        'status', b.status,
+                        'default_parse_mode', b.default_parse_mode,
+                        'support_username', b.support_username,
+                        'website_url', b.website_url,
+                        'channel_url', b.channel_url,
+                        'buy_url', b.buy_url,
+                        'notes', b.notes,
+                        'last_error', b.last_error
+                      ) as bot_payload
+                    from claimed
+                    join public.crm_subscriptions s on s.id = claimed.subscription_id
+                    left join public.telegram_bots b on b.id = claimed.bot_id
+                    """
+                    ,
+                    limit
+                )
+
+        jobs: list[ReminderDeliveryJob] = []
+        for row in rows:
+            bot_payload = row["bot_payload"]
+            bot = None
+            if bot_payload and bot_payload.get("id"):
+                bot = BotRecord(
+                    id=str(bot_payload["id"]),
+                    name=bot_payload["name"],
+                    public_title=bot_payload["public_title"] or "",
+                    bot_username=bot_payload["bot_username"] or "",
+                    bot_token=bot_payload["bot_token"],
+                    webhook_secret=bot_payload["webhook_secret"],
+                    template_key=bot_payload["template_key"] or "promo_funnel",
+                    status=bot_payload["status"] or "draft",
+                    default_parse_mode=bot_payload["default_parse_mode"] or "markdown",
+                    support_username=bot_payload["support_username"] or "",
+                    website_url=bot_payload["website_url"] or "",
+                    channel_url=bot_payload["channel_url"] or "",
+                    buy_url=bot_payload["buy_url"] or "",
+                    notes=bot_payload["notes"] or "",
+                    last_error=bot_payload["last_error"] or ""
+                )
+
+            jobs.append(
+                ReminderDeliveryJob(
+                    id=str(row["id"]),
+                    channel=row["channel"],
+                    bot=bot,
+                    subscription_id=str(row["subscription_id"]),
+                    client_id=str(row["client_id"]),
+                    reminder_day=int(row["reminder_day"] or 0),
+                    due_date=row["due_date"],
+                    attempts=int(row["attempt_count"] or 0),
+                    target_email=row["target_email"] or "",
+                    chat_id=int(row["chat_id"]) if row["chat_id"] is not None else None,
+                    client_name=row["client_name"] or "",
+                    service_name=row["service_name"] or "",
+                    plan_name=row["plan_name"] or "",
+                    expires_at=row["expires_at"],
+                    payload=row["payload"] or {}
+                )
+            )
+
+        return jobs
+
+    async def mark_subscription_reminder_sent(self, reminder_id: str, provider_message_id: str = "") -> None:
+        await self.pool.execute(
+            """
+            update public.crm_subscription_reminder_deliveries
+            set
+              status = 'sent',
+              sent_at = now(),
+              processed_at = now(),
+              provider_message_id = $2,
+              last_error = '',
+              updated_at = now()
+            where id = $1::uuid
+            """,
+            reminder_id,
+            provider_message_id[:2000]
+        )
+
+    async def retry_or_fail_subscription_reminder(
+        self,
+        reminder_id: str,
+        *,
+        attempts: int,
+        max_attempts: int,
+        error_message: str
+    ) -> None:
+        next_status = "failed" if attempts >= max_attempts else "queued"
+
+        await self.pool.execute(
+            """
+            update public.crm_subscription_reminder_deliveries
+            set
+              status = $2,
+              last_error = $3,
+              processed_at = case when $2 = 'failed' then now() else processed_at end,
+              updated_at = now()
+            where id = $1::uuid
+            """,
+            reminder_id,
+            next_status,
+            error_message[:2000]
         )

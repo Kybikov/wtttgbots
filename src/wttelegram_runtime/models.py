@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 
@@ -64,3 +64,21 @@ class DeliveryJob:
     attempts: int
     message_payload: dict[str, Any]
 
+
+@dataclass(slots=True)
+class ReminderDeliveryJob:
+    id: str
+    channel: str
+    bot: BotRecord | None
+    subscription_id: str
+    client_id: str
+    reminder_day: int
+    due_date: date
+    attempts: int
+    target_email: str
+    chat_id: int | None
+    client_name: str
+    service_name: str
+    plan_name: str
+    expires_at: datetime | None
+    payload: dict[str, Any]
